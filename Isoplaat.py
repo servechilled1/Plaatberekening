@@ -1,25 +1,44 @@
 import streamlit as st
 st.set_page_config(layout="wide")
 
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-import pandas as pd
+# --- Safe imports (toon nette foutmelding als libs ontbreken) ---
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+except ModuleNotFoundError as e:
+    st.error("Matplotlib ontbreekt. Installeer met: `pip install matplotlib` of voeg het toe aan requirements.txt")
+    st.stop()
+
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    st.error("Pandas ontbreekt. Installeer met: `pip install pandas`.")
+    st.stop()
+
+try:
+    from fpdf import FPDF
+except ModuleNotFoundError:
+    st.error("FPDF ontbreekt. Installeer met: `pip install fpdf`.\n(Je kunt desnoods de PDF-functie uitschakelen.)")
+    st.stop()
+
 import io
-from fpdf import FPDF
 import random
 import copy
 
 """
-Plaatoptimalisatie Tool
------------------------
-• Max-rectangles + Shelf (rij) algoritme; beide worden geprobeerd, beste resultaat wordt gekozen.
-• Elk onderdeel mag 90° draaien; per plaatsing kiest de code de beste oriëntatie.
-• Multi-run + meerdere heuristieken (area/short/long) voor Max-Rects.
-• Instelbare kerf (zaagspleet) – alleen rechts/onder, zodat buitenranden strak blijven.
-• Grid, legenda, nette tabellen. Geen tekst-overlap.
+Plaatoptimalisatie Tool – complete aangepaste versie
+----------------------------------------------------
+• Kiest zélf de beste 0°/90° oriëntatie per onderdeel (je hoeft niets om te draaien).
+• Probeert 2 algoritmes (Shelf + Max-Rects) en neemt het beste resultaat (minst platen → minst afval).
+• Max-Rects doet meerdere random runs en heuristieken om betere oplossingen te vinden.
+• Instelbare kerf (zaagspleet), toegepast aan RECHTS & ONDER van elk stuk.
+• Gridlijnen, legenda, overzichtstabellen. Geen overlappende tekst.
+• Veilige imports + duidelijke foutmelding als libs missen.
 """
 
-# ========= Data modellen =========
+# =============================
+#  DATA MODELLEN
+# =============================
 class Part:
     def __init__(self, label, w, h, qty, color):
         self.label = label
@@ -27,46 +46,55 @@ class Part:
         self.h = int(h)
         self.qty = int(qty)
         self.color = color
-    def area(self): return self.w * self.h
-    def copy(self): return Part(self.label, self.w, self.h, self.qty, self.color)
+    def area(self):
+        return self.w * self.h
+    def copy(self):
+        return Part(self.label, self.w, self.h, self.qty, self.color)
 
 class Rect:
     def __init__(self, x, y, w, h):
         self.x = x; self.y = y; self.w = w; self.h = h
-    def area(self): return self.w * self.h
+    def area(self):
+        return self.w * self.h
 
-# ========= Helpers =========
+# =============================
+#  HULPFUNCTIES
+# =============================
+
 def _apply_kerf(w, h, kerf):
-    # kerf alleen rechts/onder
+    """Kerf alleen rechts/onder toevoegen zodat buitenrand strak blijft."""
     return w + kerf, h + kerf
 
-# ---- Max-rects helpers ----
+# -------- MAX-RECTS helpers -------- #
+
 def _fits(fr: Rect, w, h):
     return w <= fr.w and h <= fr.h
 
+
 def _split_free_rect(fr: Rect, used):
+    """Split free rect fr by used rect (guillotine)."""
     new_rects = []
     if not (used['x'] >= fr.x + fr.w or used['x'] + used['w'] <= fr.x or
             used['y'] >= fr.y + fr.h or used['y'] + used['h'] <= fr.y):
-        # boven
+        # Boven
         if used['y'] > fr.y:
             new_rects.append(Rect(fr.x, fr.y, fr.w, used['y'] - fr.y))
-        # onder
+        # Onder
         bottom = used['y'] + used['h']
         if bottom < fr.y + fr.h:
             new_rects.append(Rect(fr.x, bottom, fr.w, (fr.y + fr.h) - bottom))
-        # links
+        # Links
         if used['x'] > fr.x:
             new_rects.append(Rect(fr.x, max(fr.y, used['y']), used['x'] - fr.x,
                                   min(fr.y + fr.h, used['y'] + used['h']) - max(fr.y, used['y'])))
-        # rechts
+        # Rechts
         right_x = used['x'] + used['w']
         if right_x < fr.x + fr.w:
-            new_rects.append(Rect(right_x, max(fr.y, used['y']),
-                                  (fr.x + fr.w) - right_x,
+            new_rects.append(Rect(right_x, max(fr.y, used['y']), (fr.x + fr.w) - right_x,
                                   min(fr.y + fr.h, used['y'] + used['h']) - max(fr.y, used['y'])))
         return new_rects, True
     return [fr], False
+
 
 def _prune(rects):
     pruned = []
@@ -80,33 +108,36 @@ def _prune(rects):
             pruned.append(r)
     return pruned
 
+
 def _choose_best_fit(free_rects, w, h, kerf, heuristic):
-    """Kies beste vrije rechthoek + oriëntatie. Score = tuple zodat we altijd de beste kiezen."""
+    """Kies beste vrije rect + oriëntatie. Score prioriteert horizontaal vullen."""
     best = None
     for idx, fr in enumerate(free_rects):
         for (cw, ch) in ((w, h), (h, w)) if w != h else ((w, h),):
             w_eff, h_eff = _apply_kerf(cw, ch, kerf)
             if _fits(fr, w_eff, h_eff):
-                horiz_waste = fr.w - cw
-                vert_waste  = fr.h - ch
-                area_waste  = fr.area() - (cw * ch)
-                pieces_in_row = (fr.w // cw) if cw > 0 else 0  # hoe vol in breedte
+                horiz_waste   = fr.w - cw
+                vert_waste    = fr.h - ch
+                area_waste    = fr.area() - (cw * ch)
+                pieces_in_row = (fr.w // cw) if cw > 0 else 0
                 if heuristic == 'area':
                     score = (area_waste, horiz_waste, vert_waste)
                 elif heuristic == 'short':
                     score = (min(horiz_waste, vert_waste), area_waste, max(horiz_waste, vert_waste))
                 elif heuristic == 'long':
                     score = (max(horiz_waste, vert_waste), area_waste, min(horiz_waste, vert_waste))
-                else:  # combined: eerst max stukken in breedte, dan horiz, vert, area
+                else:  # combined
                     score = (-pieces_in_row, horiz_waste, vert_waste, area_waste)
                 if best is None or score < best['score']:
                     best = dict(idx=idx, w=cw, h=ch, w_eff=w_eff, h_eff=h_eff, score=score)
     return best
 
-def pack_plate_maxrects(W, H, parts_left, kerf, heuristic='area'):
+
+def pack_plate_maxrects(W, H, parts_left, kerf, heuristic='combined'):
     free_rects = [Rect(0, 0, W, H)]
     placed = []
     parts_left.sort(key=lambda p: p.area(), reverse=True)
+
     for p in parts_left:
         while p.qty > 0:
             best = None
@@ -119,25 +150,29 @@ def pack_plate_maxrects(W, H, parts_left, kerf, heuristic='area'):
             fr = free_rects[best['idx']]
             used = dict(x=fr.x, y=fr.y, w=best['w'], h=best['h'])
             placed.append(dict(**used, label=p.label, color=p.color))
+
             used_exp = dict(x=used['x'], y=used['y'], w=best['w_eff'], h=best['h_eff'])
             new_free = []
             for fr2 in free_rects:
                 split_rects, did = _split_free_rect(fr2, used_exp)
-                if did: new_free.extend(split_rects)
-                else:   new_free.append(fr2)
+                if did:
+                    new_free.extend(split_rects)
+                else:
+                    new_free.append(fr2)
             free_rects = _prune(new_free)
             p.qty -= 1
     return placed, parts_left
 
-# ---- Shelf / row packer ----
+# -------- Shelf / Row packer -------- #
+
 def pack_plate_shelf(W, H, parts_left, kerf):
     placed = []
     x = y = 0
     row_h = 0
     parts_left.sort(key=lambda p: max(p.w, p.h), reverse=True)
+
     for p in parts_left:
         while p.qty > 0:
-            # beide rotaties testen; score: meest stukken in rij, dan horizontale waste
             candidates = []
             for (cw, ch) in ((p.w, p.h), (p.h, p.w)) if p.w != p.h else ((p.w, p.h),):
                 w_eff, h_eff = _apply_kerf(cw, ch, kerf)
@@ -160,8 +195,9 @@ def pack_plate_shelf(W, H, parts_left, kerf):
                     return placed, parts_left
     return placed, parts_left
 
-# ---- Wrapper: kies beste tussen beide methodes ----
-def pack_all(W, H, parts, kerf, heuristic='combined', runs=20):
+# -------- Wrapper: kies beste -------- #
+
+def pack_all(W, H, parts, kerf, heuristic='combined', runs=25):
     # Shelf eerst
     shelf_parts = [p.copy() for p in parts]
     plates_shelf = []
@@ -171,7 +207,7 @@ def pack_all(W, H, parts, kerf, heuristic='combined', runs=20):
     rest_shelf = sum((W*H - sum(r['w']*r['h'] for r in pl)) for pl in plates_shelf)
     score_shelf = (len(plates_shelf), rest_shelf)
 
-    # Max-rects multi-run
+    # Max-Rects meerdere runs/heuristieken
     best_mr = None
     random.seed(42)
     heur_to_try = [heuristic] if heuristic != 'all' else ['combined','area','short','long']
@@ -189,11 +225,12 @@ def pack_all(W, H, parts, kerf, heuristic='combined', runs=20):
             if best_mr is None or score < best_mr['score']:
                 best_mr = dict(plates=plates_h, score=score)
 
-    if best_mr and best_mr['score'] < score_shelf:
-        return best_mr['plates']
-    return plates_shelf
+    return best_mr['plates'] if best_mr and best_mr['score'] < score_shelf else plates_shelf
 
-# ========= Teken / PDF =========
+# =============================
+#  TEKENEN / PDF
+# =============================
+
 def draw_plate_png(placed, plate_no, W, H, grid_step, rest_pct):
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.set_xlim(0, W); ax.set_ylim(0, H)
@@ -223,6 +260,7 @@ def draw_plate_png(placed, plate_no, W, H, grid_step, rest_pct):
     buf.seek(0)
     return buf, legend
 
+
 def build_pdf(images):
     pdf = FPDF(orientation='L', unit='mm', format='A4')
     for img in images:
@@ -233,7 +271,10 @@ def build_pdf(images):
     out.seek(0)
     return out
 
-# ========= Streamlit UI =========
+# =============================
+#  STREAMLIT UI
+# =============================
+
 st.title('🔪 Plaatoptimalisatie Tool – minimale afval, rotatie & kerf')
 
 with st.form('inp'):
@@ -249,17 +290,12 @@ with st.form('inp'):
     with c5:
         runs = st.number_input('Optimalisatie-runs (MR)', 1, 200, 30, 1)
 
-    heuristic_choice = st.selectbox(
-        'Heuristiek Max-Rects',
-        ['combined','area','short','long','all'],
-        index=0,
-        help='\"all\" test alles. \"combined\" stuurt op horizontaal vullen eerst.'
-    )
+    heuristic_choice = st.selectbox('Heuristiek Max-Rects', ['combined','area','short','long','all'], index=0,
+                                    help='"all" test alles. "combined" focust eerst op horizontaal vullen.')
 
     n = st.number_input('Aantal verschillende onderdelen', 1, 20, 2, 1)
     parts = []
-    default_colors = ["#A3CEF1", "#90D26D", "#F29E4C", "#E59560", "#B56576",
-                      "#6D597A", "#355070", "#43AA8B", "#FFB5A7", "#BDE0FE"]
+    default_colors = ["#A3CEF1", "#90D26D", "#F29E4C", "#E59560", "#B56576", "#6D597A", "#355070", "#43AA8B", "#FFB5A7", "#BDE0FE"]
     for i in range(n):
         st.markdown(f"#### Onderdeel {i+1}")
         cc = st.columns(5)
@@ -281,20 +317,16 @@ if run:
         used_area = sum(r['w'] * r['h'] for r in placed)
         rest_pct = 100 - (used_area / (W * H) * 100)
 
-        # overzicht per plaat
         rows = {}
         for r in placed:
             key = f"{r['label']} ({r['w']}×{r['h']})"
             rows[key] = rows.get(key, 0) + 1
-        summary_df = pd.DataFrame(
-            [[k, v] for k, v in rows.items()],
-            columns=['Onderdeel (afm)', 'Aantal']
-        ).sort_values('Onderdeel (afm)')
+        summary_df = pd.DataFrame([[k, v] for k, v in rows.items()], columns=['Onderdeel (afm)', 'Aantal']).sort_values('Onderdeel (afm)')
 
         buf, legend = draw_plate_png(placed, idx, W, H, grid, rest_pct)
         images.append(buf)
 
-        colA, colB = st.columns([3, 2])
+        colA, colB = st.columns([3,2])
         with colA:
             st.image(buf, caption=f'Plaat {idx}', use_container_width=True)
         with colB:
@@ -312,5 +344,5 @@ if run:
         st.divider()
 
     pdf_bytes = build_pdf(images)
-    st.download_button('📄 Download PDF', data=pdf_bytes,
-                       file_name='plaatindeling.pdf', mime='application/pdf')
+    st.download_button('📄 Download PDF', data=pdf_bytes, file_name='plaatindeling.pdf', mime='application/pdf')
+
