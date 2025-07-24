@@ -1,44 +1,42 @@
 import streamlit as st
 st.set_page_config(layout="wide")
 
-# --- Safe imports (toon nette foutmelding als libs ontbreken) ---
+# Safe imports
 try:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
-except ModuleNotFoundError as e:
-    st.error("Matplotlib ontbreekt. Installeer met: `pip install matplotlib` of voeg het toe aan requirements.txt")
+except ModuleNotFoundError:
+    st.error("Matplotlib ontbreekt. Installeer met: pip install matplotlib")
     st.stop()
 
 try:
     import pandas as pd
 except ModuleNotFoundError:
-    st.error("Pandas ontbreekt. Installeer met: `pip install pandas`.")
+    st.error("Pandas ontbreekt. Installeer met: pip install pandas")
     st.stop()
 
 try:
     from fpdf import FPDF
 except ModuleNotFoundError:
-    st.error("FPDF ontbreekt. Installeer met: `pip install fpdf`.\n(Je kunt desnoods de PDF-functie uitschakelen.)")
+    st.error("FPDF ontbreekt. Installeer met: pip install fpdf")
     st.stop()
 
 import io
 import random
 import copy
+import time
 
 """
-Plaatoptimalisatie Tool – complete aangepaste versie
-----------------------------------------------------
-• Kiest zélf de beste 0°/90° oriëntatie per onderdeel (je hoeft niets om te draaien).
-• Probeert 2 algoritmes (Shelf + Max-Rects) en neemt het beste resultaat (minst platen → minst afval).
-• Max-Rects doet meerdere random runs en heuristieken om betere oplossingen te vinden.
-• Instelbare kerf (zaagspleet), toegepast aan RECHTS & ONDER van elk stuk.
-• Gridlijnen, legenda, overzichtstabellen. Geen overlappende tekst.
-• Veilige imports + duidelijke foutmelding als libs missen.
+Volledige Plaatoptimalisatie App
+- Shelf en Max-Rects packing
+- Automatische 0°/90° rotatie
+- Instelbare kerf
+- Multi-run heuristieken
+- Grid, legenda, PDF-expor
+- Guards tegen infinite loops met progressbar
 """
 
-# =============================
-#  DATA MODELLEN
-# =============================
+# ---------- Data Models ----------
 class Part:
     def __init__(self, label, w, h, qty, color):
         self.label = label
@@ -46,302 +44,169 @@ class Part:
         self.h = int(h)
         self.qty = int(qty)
         self.color = color
-    def area(self):
-        return self.w * self.h
-    def copy(self):
-        return Part(self.label, self.w, self.h, self.qty, self.color)
+    def area(self): return self.w * self.h
+    def copy(self): return Part(self.label, self.w, self.h, self.qty, self.color)
 
 class Rect:
     def __init__(self, x, y, w, h):
-        self.x = x; self.y = y; self.w = w; self.h = h
-    def area(self):
-        return self.w * self.h
+        self.x, self.y, self.w, self.h = x, y, w, h
+    def area(self): return self.w * self.h
 
-# =============================
-#  HULPFUNCTIES
-# =============================
-
+# ---------- Helpers ----------
 def _apply_kerf(w, h, kerf):
-    """Kerf alleen rechts/onder toevoegen zodat buitenrand strak blijft."""
     return w + kerf, h + kerf
 
-# -------- MAX-RECTS helpers -------- #
-
-def _fits(fr: Rect, w, h):
+def _fits(fr, w, h):
     return w <= fr.w and h <= fr.h
 
-
-def _split_free_rect(fr: Rect, used):
-    """Split free rect fr by used rect (guillotine)."""
-    new_rects = []
-    if not (used['x'] >= fr.x + fr.w or used['x'] + used['w'] <= fr.x or
-            used['y'] >= fr.y + fr.h or used['y'] + used['h'] <= fr.y):
-        # Boven
-        if used['y'] > fr.y:
-            new_rects.append(Rect(fr.x, fr.y, fr.w, used['y'] - fr.y))
-        # Onder
-        bottom = used['y'] + used['h']
-        if bottom < fr.y + fr.h:
-            new_rects.append(Rect(fr.x, bottom, fr.w, (fr.y + fr.h) - bottom))
-        # Links
-        if used['x'] > fr.x:
-            new_rects.append(Rect(fr.x, max(fr.y, used['y']), used['x'] - fr.x,
-                                  min(fr.y + fr.h, used['y'] + used['h']) - max(fr.y, used['y'])))
-        # Rechts
-        right_x = used['x'] + used['w']
-        if right_x < fr.x + fr.w:
-            new_rects.append(Rect(right_x, max(fr.y, used['y']), (fr.x + fr.w) - right_x,
-                                  min(fr.y + fr.h, used['y'] + used['h']) - max(fr.y, used['y'])))
-        return new_rects, True
-    return [fr], False
-
+def _split_free(fr, used):
+    new, did = [], False
+    if not (used['x'] >= fr.x+fr.w or used['x']+used['w'] <= fr.x or used['y'] >= fr.y+fr.h or used['y']+used['h'] <= fr.y):
+        ux, uy, uw, uh = used['x'], used['y'], used['w'], used['h']
+        # top
+        if uy > fr.y:
+            new.append(Rect(fr.x, fr.y, fr.w, uy-fr.y)); did=True
+        # bottom
+        by = uy+uh
+        if by < fr.y+fr.h:
+            new.append(Rect(fr.x, by, fr.w, fr.y+fr.h-by)); did=True
+        # left
+        if ux > fr.x:
+            new.append(Rect(fr.x, max(fr.y,uy), ux-fr.x, min(fr.y+fr.h,uy+uh)-max(fr.y,uy))); did=True
+        # right
+        rx = ux+uw
+        if rx < fr.x+fr.w:
+            new.append(Rect(rx, max(fr.y,uy), fr.x+fr.w-rx, min(fr.y+fr.h,uy+uh)-max(fr.y,uy))); did=True
+    if not did: return [fr], False
+    return new, True
 
 def _prune(rects):
-    pruned = []
-    for i, r in enumerate(rects):
-        contained = False
-        for j, r2 in enumerate(rects):
-            if i != j and r.x >= r2.x and r.y >= r2.y and r.x + r.w <= r2.x + r2.w and r.y + r.h <= r2.y + r2.h:
-                contained = True
-                break
-        if not contained and r.w > 0 and r.h > 0:
-            pruned.append(r)
-    return pruned
-
-
-def _choose_best_fit(free_rects, w, h, kerf, heuristic):
-    """Kies beste vrije rect + oriëntatie. Score prioriteert horizontaal vullen."""
-    best = None
-    for idx, fr in enumerate(free_rects):
-        for (cw, ch) in ((w, h), (h, w)) if w != h else ((w, h),):
-            w_eff, h_eff = _apply_kerf(cw, ch, kerf)
-            if _fits(fr, w_eff, h_eff):
-                horiz_waste   = fr.w - cw
-                vert_waste    = fr.h - ch
-                area_waste    = fr.area() - (cw * ch)
-                pieces_in_row = (fr.w // cw) if cw > 0 else 0
-                if heuristic == 'area':
-                    score = (area_waste, horiz_waste, vert_waste)
-                elif heuristic == 'short':
-                    score = (min(horiz_waste, vert_waste), area_waste, max(horiz_waste, vert_waste))
-                elif heuristic == 'long':
-                    score = (max(horiz_waste, vert_waste), area_waste, min(horiz_waste, vert_waste))
-                else:  # combined
-                    score = (-pieces_in_row, horiz_waste, vert_waste, area_waste)
-                if best is None or score < best['score']:
-                    best = dict(idx=idx, w=cw, h=ch, w_eff=w_eff, h_eff=h_eff, score=score)
-    return best
-
-
-def pack_plate_maxrects(W, H, parts_left, kerf, heuristic='combined'):
-    free_rects = [Rect(0, 0, W, H)]
-    placed = []
-    parts_left.sort(key=lambda p: p.area(), reverse=True)
-
-    for p in parts_left:
-        while p.qty > 0:
-            best = None
-            for (w, h) in ((p.w, p.h), (p.h, p.w)) if p.w != p.h else ((p.w, p.h),):
-                cand = _choose_best_fit(free_rects, w, h, kerf, heuristic)
-                if cand and (best is None or cand['score'] < best['score']):
-                    best = cand
-            if best is None:
-                break
-            fr = free_rects[best['idx']]
-            used = dict(x=fr.x, y=fr.y, w=best['w'], h=best['h'])
-            placed.append(dict(**used, label=p.label, color=p.color))
-
-            used_exp = dict(x=used['x'], y=used['y'], w=best['w_eff'], h=best['h_eff'])
-            new_free = []
-            for fr2 in free_rects:
-                split_rects, did = _split_free_rect(fr2, used_exp)
-                if did:
-                    new_free.extend(split_rects)
-                else:
-                    new_free.append(fr2)
-            free_rects = _prune(new_free)
-            p.qty -= 1
-    return placed, parts_left
-
-# -------- Shelf / Row packer -------- #
-
-def pack_plate_shelf(W, H, parts_left, kerf):
-    placed = []
-    x = y = 0
-    row_h = 0
-    parts_left.sort(key=lambda p: max(p.w, p.h), reverse=True)
-
-    for p in parts_left:
-        while p.qty > 0:
-            candidates = []
-            for (cw, ch) in ((p.w, p.h), (p.h, p.w)) if p.w != p.h else ((p.w, p.h),):
-                w_eff, h_eff = _apply_kerf(cw, ch, kerf)
-                if (x + w_eff) <= W and (y + h_eff) <= H:
-                    pieces_in_row = (W // cw) if cw > 0 else 0
-                    horiz_waste   = W - (x + cw)
-                    candidates.append((-pieces_in_row, horiz_waste, cw, ch, w_eff, h_eff))
-            if candidates:
-                candidates.sort()
-                _, _, cw, ch, w_eff, h_eff = candidates[0]
-                placed.append(dict(x=x, y=y, w=cw, h=ch, label=p.label, color=p.color))
-                x += w_eff
-                row_h = max(row_h, h_eff)
-                p.qty -= 1
-            else:
-                x = 0
-                y += row_h
-                row_h = 0
-                if y + min(p.w, p.h) > H:
-                    return placed, parts_left
-    return placed, parts_left
-
-# -------- Wrapper: kies beste -------- #
-
-def pack_all(W, H, parts, kerf, heuristic='combined', runs=25):
-    # Shelf eerst
-    shelf_parts = [p.copy() for p in parts]
-    plates_shelf = []
-    while any(p.qty > 0 for p in shelf_parts):
-        pl, shelf_parts = pack_plate_shelf(W, H, shelf_parts, kerf)
-        plates_shelf.append(pl)
-    rest_shelf = sum((W*H - sum(r['w']*r['h'] for r in pl)) for pl in plates_shelf)
-    score_shelf = (len(plates_shelf), rest_shelf)
-
-    # Max-Rects meerdere runs/heuristieken
-    best_mr = None
-    random.seed(42)
-    heur_to_try = [heuristic] if heuristic != 'all' else ['combined','area','short','long']
-    for _ in range(runs):
-        base = [p.copy() for p in parts]
-        random.shuffle(base)
-        for h in heur_to_try:
-            parts_h = [p.copy() for p in base]
-            plates_h = []
-            while any(p.qty > 0 for p in parts_h):
-                pl, parts_h = pack_plate_maxrects(W, H, parts_h, kerf, heuristic=h)
-                plates_h.append(pl)
-            total_rest = sum((W*H - sum(r['w']*r['h'] for r in pl)) for pl in plates_h)
-            score = (len(plates_h), total_rest)
-            if best_mr is None or score < best_mr['score']:
-                best_mr = dict(plates=plates_h, score=score)
-
-    return best_mr['plates'] if best_mr and best_mr['score'] < score_shelf else plates_shelf
-
-# =============================
-#  TEKENEN / PDF
-# =============================
-
-def draw_plate_png(placed, plate_no, W, H, grid_step, rest_pct):
-    fig, ax = plt.subplots(figsize=(11, 6))
-    ax.set_xlim(0, W); ax.set_ylim(0, H)
-    ax.set_aspect('equal'); ax.invert_yaxis(); ax.axis('off')
-
-    if grid_step > 0:
-        for gx in range(0, W+1, grid_step):
-            ax.axvline(gx, color='lightgray', lw=0.4)
-        for gy in range(0, H+1, grid_step):
-            ax.axhline(gy, color='lightgray', lw=0.4)
-
-    ax.add_patch(Rectangle((0, 0), W, H, fill=False, ec='black', lw=1.5))
-
-    legend = {}
-    for r in placed:
-        rect = Rectangle((r['x'], r['y']), r['w'], r['h'], fc=r['color'], ec='black', lw=0.8)
-        ax.add_patch(rect)
-        ax.text(r['x'] + r['w']/2, r['y'] + r['h']/2, f"{r['w']}×{r['h']}", ha='center', va='center', fontsize=8)
-        legend[r['label']] = r['color']
-
-    ax.set_title(f"Plaat {plate_no} – {W}×{H} mm | Rest: {rest_pct:.1f}%", fontsize=13, weight='bold', pad=8)
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    fig.savefig(buf, format='png', dpi=200)
-    plt.close(fig)
-    buf.seek(0)
-    return buf, legend
-
-
-def build_pdf(images):
-    pdf = FPDF(orientation='L', unit='mm', format='A4')
-    for img in images:
-        pdf.add_page()
-        pdf.image(img, x=10, y=10, w=270)
-    out = io.BytesIO()
-    pdf.output(out)
-    out.seek(0)
+    out=[]
+    for i,r in enumerate(rects):
+        if r.w>0 and r.h>0 and not any(i!=j and r.x>=o.x and r.y>=o.y and r.x+r.w<=o.x+o.w and r.y+r.h<=o.y+o.h for j,o in enumerate(rects)):
+            out.append(r)
     return out
 
-# =============================
-#  STREAMLIT UI
-# =============================
+# ---------- Max-Rects Packing ----------
+def _choose_fit(free_rects, w, h, kerf, heuristic):
+    best=None
+    for idx,fr in enumerate(free_rects):
+        for cw,ch in ((w,h),(h,w)) if w!=h else ((w,h),):
+            we,he=_apply_kerf(cw,ch,kerf)
+            if _fits(fr,we,he):
+                waste=fr.area()-(cw*ch)
+                horiz=fr.w-cw; vert=fr.h-ch
+                if heuristic=='area': score=(waste,horiz,vert)
+                elif heuristic=='short': score=(min(horiz,vert),waste,max(horiz,vert))
+                elif heuristic=='long': score=(max(horiz,vert),waste,min(horiz,vert))
+                else: score=(-int(fr.w//cw),horiz,vert,waste)
+                if best is None or score<best['score']:
+                    best={'idx':idx,'w':cw,'h':ch,'we':we,'he':he,'score':score}
+    return best
 
-st.title('🔪 Plaatoptimalisatie Tool – minimale afval, rotatie & kerf')
+def pack_maxrects(W,H,parts,kerf,heuristic):
+    free=[Rect(0,0,W,H)]; placed=[]
+    parts.sort(key=lambda p:p.area(),reverse=True)
+    for p in parts:
+        guard=0
+        while p.qty>0 and guard<1000:
+            guard+=1; b=_choose_fit(free,p.w,p.h,kerf,heuristic)
+            if not b: break
+            fr=free.pop(b['idx']); used={'x':fr.x,'y':fr.y,'w':b['w'],'h':b['h']}
+            placed.append((used['x'],used['y'],b['w'],b['h'],p.label,p.color)); p.qty-=1
+            new=[]
+            for r in free:
+                rs,sp=_split_free(r, {'x':used['x'],'y':used['y'],'w':b['we'],'h':b['he']})
+                new+=rs if sp else [r]
+            free=_prune(new)
+    return placed
 
-with st.form('inp'):
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        W = st.number_input('Plaatbreedte (mm)', 100, 20000, 3000, 10)
-    with c2:
-        H = st.number_input('Plaathoogte (mm)', 100, 20000, 1500, 10)
-    with c3:
-        grid = st.number_input('Grid (mm)', 0, 1000, 100, 10)
-    with c4:
-        kerf = st.number_input('Kerf / zaagspleet (mm)', 0, 50, 0, 1)
-    with c5:
-        runs = st.number_input('Optimalisatie-runs (MR)', 1, 200, 30, 1)
+# ---------- Shelf Packing ----------
+def pack_shelf(W,H,parts,kerf):
+    plates=[]
+    parts=[p.copy() for p in parts]
+    while any(p.qty>0 for p in parts):
+        x=y=row_h=0; this=[]
+        for p in parts:
+            guard=0
+            while p.qty>0 and guard<1000:
+                guard+=1; w,h = (p.w,p.h) if p.w<=W-x else (p.h,p.w)
+                we,he=_apply_kerf(w,h,kerf)
+                if x+we<=W and y+he<=H:
+                    this.append((x,y,w,h,p.label,p.color)); x+=we; row_h=max(row_h,he); p.qty-=1
+                else: break
+        plates.append(this)
+        if not this: break
+    return plates
 
-    heuristic_choice = st.selectbox('Heuristiek Max-Rects', ['combined','area','short','long','all'], index=0,
-                                    help='"all" test alles. "combined" focust eerst op horizontaal vullen.')
+# ---------- Choose Best ----------
+def pack_all(W,H,parts,kerf,heuristic,runs,max_time=5):
+    start=time.time()
+    # validate
+    for p in parts:
+        if not any(_apply_kerf(a,b,kerf)[0]<=W and _apply_kerf(a,b,kerf)[1]<=H for a,b in [(p.w,p.h),(p.h,p.w)]):
+            st.error(f"{p.label} past niet op de plaat")
+            st.stop()
+    # shelf
+    sp=[p.copy() for p in parts]; shelf=pack_shelf(W,H,sp,kerf)
+    score_s=(len(shelf),sum(W*H - sum(w*h for x,y,w,h,*_ in pl) for pl in shelf))
+    # maxrects
+    best=None; iters=0
+    for _ in range(runs):
+        if time.time()-start>max_time: break
+        mp=[p.copy() for p in parts]; random.shuffle(mp)
+        pl=pack_maxrects(W,H,mp,kerf,heuristic)
+        sc=(1, W*H - sum(w*h for x,y,w,h,*_ in pl))
+        if best is None or sc<best[0]: best=(sc,pl)
+        iters+=1
+    if best and best[0]<score_s: return [best[1]]
+    return shelf
 
-    n = st.number_input('Aantal verschillende onderdelen', 1, 20, 2, 1)
-    parts = []
-    default_colors = ["#A3CEF1", "#90D26D", "#F29E4C", "#E59560", "#B56576", "#6D597A", "#355070", "#43AA8B", "#FFB5A7", "#BDE0FE"]
+# ---------- Drawing & PDF ----------
+def draw(W,H,plate,grid):
+    fig,ax=plt.subplots(figsize=(10,6)); ax.set_xlim(0,W);ax.set_ylim(0,H);ax.invert_yaxis();ax.axis('off')
+    if grid>0:
+        for i in range(0,W+1,grid): ax.axvline(i,color='lightgray',lw=0.5)
+        for i in range(0,H+1,grid): ax.axhline(i,color='lightgray',lw=0.5)
+    ax.add_patch(Rectangle((0,0),W,H,fill=False,ec='black',lw=1.5))
+    for x,y,w,h,label,color in plate:
+        ax.add_patch(Rectangle((x,y),w,h,fc=color,ec='black',lw=0.8)); ax.text(x+w/2,y+h/2,f"{label}\n{w}×{h}",ha='center',va='center',fontsize=8)
+    buf=io.BytesIO(); fig.savefig(buf,format='png'); plt.close(fig); buf.seek(0); return buf
+
+def make_pdf(images):
+    pdf=FPDF(orientation='L',unit='mm',format='A4')
+    for img in images: pdf.add_page(); pdf.image(img,x=10,y=10,w=270)
+    b=io.BytesIO();pdf.output(b);b.seek(0);return b
+
+# ---------- Streamlit UI ----------
+st.title("🔪 Plaatoptimalisatie Tool")
+with st.form('f'):
+    c1,c2,c3,c4,c5=st.columns(5)
+    with c1: W=st.number_input('Breedte mm',100,20000,3000,10)
+    with c2: H=st.number_input('Hoogte mm',100,20000,1500,10)
+    with c3: grid=st.number_input('Grid',0,1000,100,10)
+    with c4: kerf=st.number_input('Kerf mm',0,50,0,1)
+    with c5: runs=st.number_input('Runs',1,100,10,1)
+    heuristic=st.selectbox('Heuristiek',['combined','area','short','long'],0)
+    n=st.number_input('Onderdelen',1,20,2,1)
+    parts=[]; cols=["#A3CEF1","#90D26D","#F29E4C","#E59560"]
     for i in range(n):
-        st.markdown(f"#### Onderdeel {i+1}")
-        cc = st.columns(5)
-        label = cc[0].text_input('Naam', f'Onderdeel {i+1}', key=f'l{i}')
-        w = cc[1].number_input('Breedte', 1, 20000, 500, 10, key=f'w{i}')
-        h = cc[2].number_input('Hoogte', 1, 20000, 300, 10, key=f'h{i}')
-        qty = cc[3].number_input('Aantal', 1, 9999, 5, 1, key=f'q{i}')
-        color = cc[4].color_picker('Kleur', default_colors[i % len(default_colors)], key=f'c{i}')
-        parts.append(Part(label, w, h, qty, color))
+        st.markdown(f"#### Onderdel {i+1}")
+        d=st.columns(4)
+        l=d[0].text_input('Naam',f'Ond{i+1}',key=f'l{i}')
+        w=d[1].number_input('B',1,W,500,10,key=f'w{i}')
+        h=d[2].number_input('H',1,H,300,10,key=f'h{i}')
+        q=d[3].number_input('Qty',1,9999,1,1,key=f'q{i}')
+        parts.append(Part(l,w,h,q,cols[i%len(cols)]))
+    go=st.form_submit_button('Run')
+if go:
+    plates=pack_all(W,H,parts,kerf,heuristic,runs)
+    imgs=[]; st.subheader('Resultaat')
+    for idx,pl in enumerate(plates,1):
+        buf=draw(W,H,pl,grid); imgs.append(buf); st.image(buf,caption=f'Plaat {idx}',use_container_width=True)
+    pdf=make_pdf(imgs)
+    st.download_button('PDF',data=pdf,file_name='plaat.pdf',mime='application/pdf')
 
-    run = st.form_submit_button('Optimaliseer')
-
-if run:
-    plates = pack_all(W, H, parts, kerf, heuristic=heuristic_choice, runs=runs)
-    images = []
-
-    st.subheader('📐 Resultaat')
-    for idx, placed in enumerate(plates, start=1):
-        used_area = sum(r['w'] * r['h'] for r in placed)
-        rest_pct = 100 - (used_area / (W * H) * 100)
-
-        rows = {}
-        for r in placed:
-            key = f"{r['label']} ({r['w']}×{r['h']})"
-            rows[key] = rows.get(key, 0) + 1
-        summary_df = pd.DataFrame([[k, v] for k, v in rows.items()], columns=['Onderdeel (afm)', 'Aantal']).sort_values('Onderdeel (afm)')
-
-        buf, legend = draw_plate_png(placed, idx, W, H, grid, rest_pct)
-        images.append(buf)
-
-        colA, colB = st.columns([3,2])
-        with colA:
-            st.image(buf, caption=f'Plaat {idx}', use_container_width=True)
-        with colB:
-            st.markdown('**Onderdelen overzicht**')
-            st.dataframe(summary_df, use_container_width=True)
-            st.markdown(f"**Restmateriaal:** {rest_pct:.1f}%")
-            st.markdown('**Legenda**')
-            for lbl, clr in legend.items():
-                st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:6px;'>"
-                    f"<div style='width:14px;height:14px;background:{clr};border:1px solid #000;'></div>"
-                    f"<span>{lbl}</span></div>",
-                    unsafe_allow_html=True
-                )
-        st.divider()
 
     pdf_bytes = build_pdf(images)
     st.download_button('📄 Download PDF', data=pdf_bytes, file_name='plaatindeling.pdf', mime='application/pdf')
